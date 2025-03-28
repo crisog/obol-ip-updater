@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -70,6 +71,30 @@ func initDB() (*sql.DB, error) {
 	return db, nil
 }
 
+func getEnvIP() (string, error) {
+	if err := godotenv.Load(); err != nil {
+		return "", fmt.Errorf("failed to load .env file: %v", err)
+	}
+
+	ip := os.Getenv(envKey)
+	if ip == "" {
+		return "", fmt.Errorf("IP not found in .env file")
+	}
+
+	return ip, nil
+}
+
+func restartCharon() error {
+	log.Printf("Restarting Charon container...")
+	cmd := exec.Command("docker", "compose", "up", "charon", "-d", "--force-recreate")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to restart Charon: %v, output: %s", err, string(output))
+	}
+	log.Printf("Successfully restarted Charon container")
+	return nil
+}
+
 func updateEnvFile(newIP string) error {
 	log.Printf("Updating .env file with new IP: %s", newIP)
 	input, err := os.ReadFile(".env")
@@ -101,6 +126,11 @@ func updateEnvFile(newIP string) error {
 	}
 
 	log.Printf("Successfully updated .env file")
+
+	if err := restartCharon(); err != nil {
+		return fmt.Errorf("failed to restart Charon after IP update: %v", err)
+	}
+
 	return nil
 }
 
@@ -132,6 +162,12 @@ func main() {
 			continue
 		}
 
+		// Check if .env and DB are in sync
+		envIP, err := getEnvIP()
+		if err != nil {
+			log.Printf("Warning: Could not get IP from .env: %v", err)
+		}
+
 		var storedIP string
 		err = db.QueryRow("SELECT ip FROM ip_store ORDER BY updated_at DESC LIMIT 1").Scan(&storedIP)
 		if err == sql.ErrNoRows {
@@ -144,7 +180,11 @@ func main() {
 			log.Printf("Current stored IP: %s", storedIP)
 		}
 
-		if err == sql.ErrNoRows || (err == nil && storedIP != currentIP) {
+		// Update if: no IP in DB, IP changed, or .env is out of sync
+		if err == sql.ErrNoRows ||
+			(err == nil && storedIP != currentIP) ||
+			(envIP != "" && envIP != storedIP) {
+
 			if err := updateEnvFile(currentIP); err != nil {
 				log.Printf("Error updating .env file: %v", err)
 				log.Printf("Retrying in %v...", checkInterval)
