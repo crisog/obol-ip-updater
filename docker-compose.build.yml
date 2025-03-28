@@ -1,0 +1,13 @@
+services:
+  builder:
+    image: golang:1.23-bullseye
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: >
+      bash -c "apt-get update && 
+      apt-get install -y build-essential gcc-x86-64-linux-gnu &&
+      CGO_ENABLED=1 CC=x86_64-linux-gnu-gcc GOOS=linux GOARCH=amd64 go build -o obol-ip-updater"
+
+volumes:
+  build_output: 
