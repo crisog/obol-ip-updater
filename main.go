@@ -21,6 +21,8 @@ const (
 	ipifyAPI      = "https://api.ipify.org?format=json"
 	checkInterval = 10 * time.Second
 	envKey        = "CHARON_P2P_EXTERNAL_HOSTNAME"
+	retryInterval = 5 * time.Second
+	httpTimeout   = 10 * time.Second
 )
 
 type IPResponse struct {
@@ -28,12 +30,20 @@ type IPResponse struct {
 }
 
 func getCurrentIP() (string, error) {
+	client := &http.Client{
+		Timeout: httpTimeout,
+	}
+
 	log.Printf("Fetching current IP from %s...", ipifyAPI)
-	resp, err := http.Get(ipifyAPI)
+	resp, err := client.Get(ipifyAPI)
 	if err != nil {
-		return "", fmt.Errorf("failed to get IP: %v", err)
+		return "", fmt.Errorf("network error while fetching IP: %v", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("received non-200 status code: %d", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -43,6 +53,10 @@ func getCurrentIP() (string, error) {
 	var ipResp IPResponse
 	if err := json.Unmarshal(body, &ipResp); err != nil {
 		return "", fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	if ipResp.IP == "" {
+		return "", fmt.Errorf("received empty IP from API")
 	}
 
 	log.Printf("Successfully fetched current IP: %s", ipResp.IP)
@@ -64,6 +78,7 @@ func initDB() (*sql.DB, error) {
 	);`
 
 	if _, err := db.Exec(createTable); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to create table: %v", err)
 	}
 
@@ -138,12 +153,6 @@ func main() {
 	log.Printf("Starting IP monitoring service...")
 	log.Printf("Check interval: %v", checkInterval)
 
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Warning: Error loading .env file: %v", err)
-	} else {
-		log.Printf("Successfully loaded .env file")
-	}
-
 	db, err := initDB()
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
@@ -153,14 +162,24 @@ func main() {
 	log.Printf("IP monitoring service started successfully")
 	log.Printf("Monitoring IP changes...")
 
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 5
+
 	for {
 		currentIP, err := getCurrentIP()
 		if err != nil {
-			log.Printf("Error getting current IP: %v", err)
-			log.Printf("Retrying in %v...", checkInterval)
-			time.Sleep(checkInterval)
+			consecutiveErrors++
+			log.Printf("Error getting current IP (attempt %d/%d): %v", consecutiveErrors, maxConsecutiveErrors, err)
+
+			if consecutiveErrors >= maxConsecutiveErrors {
+				log.Printf("Multiple consecutive errors detected. Increasing retry interval...")
+				time.Sleep(checkInterval * 2) // Double the wait time after multiple failures
+			} else {
+				time.Sleep(retryInterval)
+			}
 			continue
 		}
+		consecutiveErrors = 0 // Reset error counter on successful IP fetch
 
 		// Check if .env and DB are in sync
 		envIP, err := getEnvIP()
@@ -174,7 +193,8 @@ func main() {
 			log.Printf("No IP found in database, storing first IP: %s", currentIP)
 		} else if err != nil {
 			log.Printf("Error querying database: %v", err)
-			time.Sleep(checkInterval)
+			log.Printf("Will retry database query in %v...", retryInterval)
+			time.Sleep(retryInterval)
 			continue
 		} else {
 			log.Printf("Current stored IP: %s", storedIP)
@@ -187,8 +207,8 @@ func main() {
 
 			if err := updateEnvFile(currentIP); err != nil {
 				log.Printf("Error updating .env file: %v", err)
-				log.Printf("Retrying in %v...", checkInterval)
-				time.Sleep(checkInterval)
+				log.Printf("Retrying in %v...", retryInterval)
+				time.Sleep(retryInterval)
 				continue
 			}
 
